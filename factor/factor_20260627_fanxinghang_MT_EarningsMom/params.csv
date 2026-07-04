@@ -1,0 +1,4 @@
+param,min,max,step,default
+win1,30,480,24,120
+win2,5,80,4,20
+win3,1,25,1,5

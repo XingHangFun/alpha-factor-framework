@@ -1,0 +1,163 @@
+量化因子全时段稳定与近期轮换双轨攻防体系白皮书 V11.1
+
+回测市场: 中证1000 全市场选200 股票, 月度调仓
+
+
+第一章 核心哲学：双轨组合构建原则
+
+本体系强制将组合因子拆分为以下双轨：
+
+1. 全时段稳健底座轨 (All-Weather Robust Base, ARB)
+   唯一目标：追求长期跨越牛熊的底座稳定性，提供策略的"安全气垫"。
+   资产特征：这类特征源于 A 股市场长期的散户/机构行为差异，不随短期宏观情绪切换而失效。
+   额外要求：在生成的稳健因子中, 加入 20% 根据市场表现自动切换动量趋势型和回归震荡型的因子 (MTR)。
+
+2. 近期爆发轮换轨 (Recent Dynamic Rotation, RDR)
+   唯一目标：捕捉当前市场周期的主线定价权，最大化截面 Alpha 收益。
+   资产特征：这类特征在特定波动率环境 (VolRegime) 下具备极强的爆发力，但带有鲜明的"保质期"。
+   定期轮换机制：每 20 个交易日 (1 个自然月) 强制进行近期因子库审计，轮换调入新的近期爆发因子。
+
+
+第二章 因子投产前的自动化三步清洗规范
+
+任何因子函数在输出前，应串联以下三步标准化矩阵操作。推荐使用 FunctionPool.factor_process()
+统一入口，按需开启/关闭步骤：
+
+    因子值
+      │
+      ├─ 1. 极值缩尾截断 (outlier='mad' | 'winsorize' | None, outlier_sigma=3.0)
+      │     默认 MAD 方法 (1.4826 缩放), 防止极端异常值对组合权重分配造成非线性扭曲
+      │
+      ├─ 2. 截面中性化 (neutralize=True, neutralize_by='market_cap')
+      │     OLS 消除市值暴露与瞬时截面偏离, 支持行业中性化 (neutralize_by='industry')
+      │
+      ├─ 3. 截面标准化 (zscore=True)
+      │     横截面 Z-Score 去量纲
+      │
+      ├─ 4. 换手成本平滑 (smooth=5)
+      │     EWM 指数衰减加权, 压降高频噪声
+      │
+      ├─ 5. 输出选项
+      │     rank_output → 映射到 [-1,1]; clip=3.0 → 截断; fillna=True → 填零
+      │
+      ▼
+    标准化因子
+
+该流水线已实现于 FunctionPool.factor_process(), 所有参数均可独立开关且有合理默认值。
+
+第三章 生成因子规范
+
+3.1 命名空间
+
+因子函数名必须遵循:
+
+    factor_YYYYMMDD_fanxinghang_策略分类_逻辑名缩写
+
+    组成部分:
+      YYYYMMDD    — 当天日期
+      fanxinghang — 固定标识
+      策略分类     — MT (动量趋势类) / MR (回归震荡类) / MTR (自动切换类)
+      逻辑名缩写   — 因子核心逻辑 (如 AmihudIlliq, CAP_DownsideSemi)
+
+    注: 因子归属 ARB 还是 RDR 轨由外部配置文件决定, 不写入函数名.
+
+    示例:
+        factor_20260627_fanxinghang_MT_GEMLinearTrend
+        factor_20260627_fanxinghang_MR_AmihudIlliq
+        factor_20260627_fanxinghang_MTR_HybridDefenseOffense
+
+    注: FACTOR_LIST 中的标签前缀 (如 '01_', '02_') 仅用于排序, 不参与命名。
+
+3.2 参数行为
+
+- 参数必须是可解释的 (如 win1=窗口, win2=平滑), 严禁无意义的机器寻优参数
+- 参数默认值决定参数搜索范围 (由 convert_factors.generate_params_csv 自动推导):
+    - int 型默认值 v: min=v//4, max=max(v*4,v+20), step=max(1,v//5)
+    - float 型默认值 v: min=v/4, max=max(v*4,v+5), step=max(0.1,v/5)
+    - bool 型: min=0, max=1, step=1
+- 参数形式: (self, win1=x, win2=y, ...), self 必须在第一位
+
+3.3 代码形态
+
+- 因子函数为模块级函数, 签名: def factor_xxx(self, win1=X, win2=Y, ...) -> pd.DataFrame
+- self 绑定到 FunctionPool (或其子类), 提供数据属性与方法
+- 因子内部可调用:
+    - 数据属性: self.close, self.open, self.high, self.low, self.volume,
+                self.market_cap, self.total_turnover
+    - FunctionPool 方法: cs_zscore, cs_rank, factor_process, vol_regime,
+                        panic_state, trend_strength, market_dispersion,
+                        regime_switch, discrete_switch, _broadcast 等
+    - 自定义辅助函数 (同文件中的其他 def, 需注册到 FACTOR_LIST 之外)
+- 辅助函数签名: def helper_name(self, ...) — 与因子函数相同的 self 约定
+
+3.4 辅助函数注册
+
+- FACTOR_LIST 中列出的函数名 = 因子
+- FACTOR_LIST 中未列出的顶层 def = 辅助函数 (helpers)
+- 辅助函数的传递依赖由 convert_factors.py 自动分析并打包
+- 当因子调用了 FunctionPool 中的方法 (如 panic_state, vol_regime),
+  可使用 convert_factors.py 的 --include-helpers-from 选项:
+
+    python convert_factors.py --to-folders factors.py \
+        --include-helpers-from FunctionPool.py
+
+  被因子实际调用的 FunctionPool 方法将自动写入因子文件夹。
+
+
+第四章 格式转换
+
+4.1 双向转换
+
+convert_factors.py 负责回测框架 (py 文件) 与组合框架 (factor 文件夹) 之间的双向转换:
+
+    回测框架格式 (py 文件):
+      def factor_xxx(self, win1=X, ...):
+          ...
+          return self.boll(c=f)
+
+    组合框架格式 (factor 文件夹):
+      factor/factor_xxx/
+        ├── factor.py    # def compute(gen, params): ...
+        └── params.csv   # param,min,max,step,default
+
+4.2 调用风格
+
+- py 文件: self.method(args) → 方法调用风格, self 绑定 FunctionPool
+- factor 文件夹: method(gen, args) → 独立函数风格, gen 为第一参数
+- 转换规则: self.attr → gen.attr (数据访问)
+             self.method(args) → method(gen, args) (方法前置为独立函数)
+- 约束: 所有辅助函数调用必须为字面量形式 (self.helper_name()), 禁止
+        动态派发 (getattr) / partial / lambda 包装
+
+4.3 往返一致性
+
+- 因子名与文件夹名一一对应, 不做前后缀修改
+- FACTOR_LIST 为字符串格式: ['factor_name1', 'factor_name2', ...]
+- 外部 helper (--include-helpers-from) 的同名方法覆盖本地定义,
+  确保 FunctionPool (权威源) 的参数完整性
+
+
+第五章 组件关系总图
+
+    rule_v11.txt (本文件)
+    │  规范制定
+    │
+    ├──► FunctionPool.py
+    │    │  27 个基类方法: cs_*/ts_*/factor_process/regime_*/
+    │    │  regime_switch / discrete_switch / _broadcast / composite_*
+    │    │
+    │    └──► factors.py / factors1.py
+    │         │  因子函数 + 辅助函数 (boll 系列等)
+    │         │  调用 self.method() 风格
+    │         │
+    │         └──► convert_factors.py
+    │              │  py ←→ factor 文件夹双向转换
+    │              │  --include-helpers-from 引入外部 helper
+    │              │  参数搜索范围自动推导
+    │              │
+    │              ▼
+    │         factor/<因子名>/factor.py + params.csv
+    │         (组合框架格式)
+    │
+    └──► 回测引擎 (用户自有)
+         FactorBacktestEngine.run_factors(factor_list)

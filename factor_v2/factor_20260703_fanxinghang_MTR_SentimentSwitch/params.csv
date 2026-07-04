@@ -1,0 +1,4 @@
+param,min,max,step,default
+win1,15,240,12,60
+win2,1,25,1,5
+panic_confirm,1,22,1,2
