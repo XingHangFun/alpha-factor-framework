@@ -2,10 +2,6 @@ import numpy as np
 import pandas as pd
 
 # ---- 辅助函数 ----
-def _broadcast(gen, market_series: pd.Series) -> pd.DataFrame:
-    """广播市场级Series到个股DataFrame."""
-    return pd.DataFrame({c: market_series.values for c in gen.close.columns}, index=market_series.index)
-
 def cs_zscore(gen, x: pd.DataFrame, clip: float=None) -> pd.DataFrame:
     """截面 z-score 标准化."""
     mu = x.mean(axis=1)
@@ -14,6 +10,18 @@ def cs_zscore(gen, x: pd.DataFrame, clip: float=None) -> pd.DataFrame:
     if clip is not None:
         result = result.clip(-clip, clip)
     return result
+
+def trend_strength(gen, window: int=60) -> pd.Series:
+    """
+        趋势强度 (0~1, 市场级).
+        高值 = 市场处于强趋势状态 (无论方向), 适合动量因子.
+        低值 = 震荡市, 适合反转因子.
+        """
+    mkt_ret = gen.close.pct_change().mean(axis=1)
+    cum = (1 + mkt_ret).rolling(window, min_periods=20).apply(lambda x: x.prod(), raw=True)
+    path = mkt_ret.abs().rolling(window, min_periods=20).sum()
+    efficiency = (abs(cum - 1) / path.replace(0, np.nan)).fillna(0)
+    return efficiency.rank(pct=True).fillna(0.5)
 
 def regime_switch(gen, trend_factor: pd.DataFrame, reversal_factor: pd.DataFrame, switch_signal: pd.Series=None, window: int=60) -> pd.DataFrame:
     """
@@ -27,17 +35,9 @@ def regime_switch(gen, trend_factor: pd.DataFrame, reversal_factor: pd.DataFrame
     raw = sw * cs_zscore(gen, trend_factor) + (1 - sw) * cs_zscore(gen, reversal_factor)
     return cs_zscore(gen, raw)
 
-def trend_strength(gen, window: int=60) -> pd.Series:
-    """
-        趋势强度 (0~1, 市场级).
-        高值 = 市场处于强趋势状态 (无论方向), 适合动量因子.
-        低值 = 震荡市, 适合反转因子.
-        """
-    mkt_ret = gen.close.pct_change().mean(axis=1)
-    cum = (1 + mkt_ret).rolling(window, min_periods=20).apply(lambda x: x.prod(), raw=True)
-    path = mkt_ret.abs().rolling(window, min_periods=20).sum()
-    efficiency = (abs(cum - 1) / path.replace(0, np.nan)).fillna(0)
-    return efficiency.rank(pct=True).fillna(0.5)
+def _broadcast(gen, market_series: pd.Series) -> pd.DataFrame:
+    """广播市场级Series到个股DataFrame."""
+    return pd.DataFrame({c: market_series.values for c in gen.close.columns}, index=market_series.index)
 
 # ---- 因子函数 ----
 def compute(gen, params):

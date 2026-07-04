@@ -93,18 +93,6 @@ class FunctionPool:
             lambda s: s.rank(pct=True).iloc[-1], raw=False
         )
 
-    def ts_ema(self, x: pd.DataFrame, span: int) -> pd.DataFrame:
-        """指数平滑 (ewm)."""
-        return x.ewm(span=span, min_periods=max(3, span // 2), adjust=False).mean()
-
-    def decay_linear(self, x: pd.DataFrame, window: int) -> pd.DataFrame:
-        """线性衰减加权平滑 (窗口内越近权重越大, 降换手)."""
-        w = np.arange(1, window + 1, dtype=float)
-        w /= w.sum()
-        return x.rolling(window, min_periods=max(5, window // 2)).apply(
-            lambda s: np.dot(s, w), raw=True
-        )
-
     def ts_corr(self, x: pd.DataFrame, y: pd.DataFrame, window: int) -> pd.DataFrame:
         """时序滚动相关系数 corr(x,y), 矢量化实现."""
         min_p = max(10, window // 2)
@@ -290,6 +278,232 @@ class FunctionPool:
         w = w / w.sum()
         raw = sum(w[i] * self.cs_zscore(f) for i, f in enumerate(factors))
         return self.cs_zscore(raw).ewm(span=smooth, min_periods=3).mean()
+
+    def composite_bayesian(
+        self,
+        factors: list[pd.DataFrame],
+        forward_returns: pd.DataFrame,
+        smooth: int = 5,
+        fit_window: int = None,
+    ) -> dict:
+        """
+        贝叶斯线性组合 — Bayesian Ridge Regression.
+
+        使用 scikit-learn BayesianRidge，自动通过 evidence approximation
+        选择正则化强度。先验: w ~ N(0, λ⁻¹I)，λ ~ Gamma。
+
+        相比等权和 IC 加权，贝叶斯组合的优势:
+        - 自动收缩: 噪声因子的权重自动趋近于零
+        - 不确定性量化: 每个权重有后验均值和标准差
+        - 无超参调优: λ 由 evidence maximization 自动选择
+
+        Parameters
+        ----------
+        factors : list of pd.DataFrame
+            因子值 (index=date, columns=stock)，每个因子应为已标准化的截面值。
+        forward_returns : pd.DataFrame
+            未来收益 (index=date, columns=stock)，回归目标。
+        smooth : int
+            输出因子 EWM 平滑 span。
+        fit_window : int, optional
+            滚动拟合窗口长度。None = 全时段一次拟合。
+            设置后每个窗口独立拟合，权重随时间变化。
+
+        Returns
+        -------
+        dict:
+            'composite': pd.DataFrame — 复合因子值 (index=date, columns=stock)
+            'weights': list of dict — [{mean, std, index}, ...] 每个因子的后验权重
+            'intercept': float — 截距项
+            'alpha': float — 权重先验精度 λ
+            'lambda': float — 噪声精度 β (=1/σ²)
+            'scores': dict — {'r2': float, 'mse': float}
+        """
+        try:
+            from sklearn.linear_model import BayesianRidge
+        except ImportError:
+            raise ImportError(
+                "composite_bayesian 需要 scikit-learn。"
+                "请安装: pip install scikit-learn"
+            )
+
+        # 1. 对齐数据: 取因子和收益的共同日期/股票
+        common_cols = factors[0].columns
+        for fv in factors[1:]:
+            common_cols = common_cols.intersection(fv.columns)
+        common_cols = common_cols.intersection(forward_returns.columns)
+        if len(common_cols) < 20:
+            raise ValueError(f"共同股票数量不足: {len(common_cols)}，需要至少 20 只。")
+
+        common_dates = factors[0].index.intersection(forward_returns.index)
+        for fv in factors[1:]:
+            common_dates = common_dates.intersection(fv.index)
+        if len(common_dates) < 50:
+            raise ValueError(f"共同日期不足: {len(common_dates)}，需要至少 50 天。")
+
+        # 对齐所有数据
+        aligned_factors = [fv.reindex(index=common_dates, columns=common_cols)
+                          for fv in factors]
+        fwd_ret = forward_returns.reindex(index=common_dates, columns=common_cols)
+
+        n_factors = len(aligned_factors)
+        n_dates = len(common_dates)
+        n_stocks = len(common_cols)
+
+        if fit_window is None:
+            fit_window = n_dates  # 全时段一次拟合
+
+        # 2. 构建回归数据: y = forward_ret, X = [f1, f2, ..., fk] (堆叠所有日期×股票)
+        #    每个因子先做截面 zscore
+        normalized = [self.cs_zscore(fv).fillna(0) for fv in aligned_factors]
+
+        # 3. 拟合贝叶斯回归
+        if fit_window >= n_dates:
+            # 全时段一次拟合
+            X, y = self._stack_for_regression(normalized, fwd_ret)
+            model, scores = self._fit_bayesian_ridge(X, y)
+            weights = [
+                {
+                    'index': i,
+                    'mean': float(model.coef_[i]),
+                    'std': float(np.sqrt(1.0 / model.lambda_))  # approximate
+                    if hasattr(model, 'lambda_') else None,
+                }
+                for i in range(n_factors)
+            ]
+            intercept = float(model.intercept_)
+            alpha = float(model.alpha_) if hasattr(model, 'alpha_') else None
+            lambda_ = float(model.lambda_) if hasattr(model, 'lambda_') else None
+
+            # 生成复合因子
+            raw_composite = sum(w['mean'] * normalized[i] for i, w in enumerate(weights))
+            composite = self.cs_zscore(raw_composite).ewm(
+                span=smooth, min_periods=max(3, smooth // 2), adjust=False
+            ).mean()
+
+        else:
+            # 滚动窗口拟合
+            weights = []
+            composite = pd.DataFrame(np.nan, index=common_dates, columns=common_cols)
+            scores_list = []
+            intercept_list = []
+            alpha_list = []
+            lambda_list = []
+
+            for t in range(fit_window, n_dates):
+                train_slice = slice(t - fit_window, t)
+                X, y = self._stack_for_regression(
+                    [fv.iloc[train_slice] for fv in normalized],
+                    fwd_ret.iloc[train_slice]
+                )
+                model, sc = self._fit_bayesian_ridge(X, y)
+                scores_list.append(sc)
+                intercept_list.append(float(model.intercept_))
+                if hasattr(model, 'alpha_'):
+                    alpha_list.append(float(model.alpha_))
+                if hasattr(model, 'lambda_'):
+                    lambda_list.append(float(model.lambda_))
+
+                w = model.coef_
+                raw = sum(float(w[i]) * normalized[i].iloc[t] for i in range(n_factors))
+                composite.iloc[t] = raw
+
+            # 聚合结果
+            composite = self.cs_zscore(composite).fillna(0).ewm(
+                span=smooth, min_periods=max(3, smooth // 2), adjust=False
+            ).mean()
+
+            avg_w = np.mean([list(scores_list[0].get('coef_', []))], axis=0) if scores_list else np.zeros(n_factors)
+            weights = [
+                {'index': i, 'mean': float(avg_w[i]) if i < len(avg_w) else 0.0, 'std': None}
+                for i in range(n_factors)
+            ]
+            intercept = float(np.mean(intercept_list)) if intercept_list else 0.0
+            alpha = float(np.mean(alpha_list)) if alpha_list else None
+            lambda_ = float(np.mean(lambda_list)) if lambda_list else None
+            scores = {
+                'r2': float(np.mean([s.get('r2', 0) for s in scores_list])),
+                'mse': float(np.mean([s.get('mse', 0) for s in scores_list])),
+            }
+
+        # 4. 构建权重诊断
+        for w in weights:
+            w['abs_weight'] = abs(w['mean'])
+        total_abs = sum(w['abs_weight'] for w in weights)
+        for w in weights:
+            w['pct_contribution'] = w['abs_weight'] / total_abs if total_abs > 0 else 0.0
+
+        return {
+            'composite': composite,
+            'weights': weights,
+            'intercept': intercept,
+            'alpha': alpha,
+            'lambda': lambda_,
+            'scores': scores,
+        }
+
+    def _stack_for_regression(
+        self,
+        normalized_factors: list[pd.DataFrame],
+        forward_returns: pd.DataFrame,
+    ) -> tuple:
+        """
+        将因子和收益堆叠为 (N, K) 的回归矩阵。
+
+        每个 (date, stock) 对是一个样本。
+        y = forward_return
+        X = [f1_value, f2_value, ..., fk_value]
+        """
+        k = len(normalized_factors)
+        # 收集所有 (date, stock) 对
+        y_vals = []
+        X_vals = []
+
+        flat_fwd = forward_returns.values
+        flat_factors = [fv.values for fv in normalized_factors]
+
+        mask = ~np.isnan(flat_fwd)
+        for i in range(k):
+            mask &= ~np.isnan(flat_factors[i])
+
+        y_vals = flat_fwd[mask]
+        X_vals = np.column_stack([ff[mask] for ff in flat_factors])
+
+        return X_vals, y_vals
+
+    def _fit_bayesian_ridge(self, X: np.ndarray, y: np.ndarray) -> tuple:
+        """拟合 BayesianRidge 并返回模型和诊断。"""
+        from sklearn.linear_model import BayesianRidge
+        from sklearn.metrics import r2_score, mean_squared_error
+
+        if len(y) < 10:
+            # 样本太少，返回零权重
+            class _Dummy:
+                coef_ = np.zeros(X.shape[1])
+                intercept_ = 0.0
+                alpha_ = 1.0
+                lambda_ = 1.0
+            return _Dummy(), {'r2': 0.0, 'mse': 0.0}
+
+        model = BayesianRidge(
+            max_iter=300,
+            tol=1e-3,
+            alpha_1=1e-6,
+            alpha_2=1e-6,
+            lambda_1=1e-6,
+            lambda_2=1e-6,
+            fit_intercept=True,
+        )
+        model.fit(X, y)
+
+        y_pred = model.predict(X)
+        scores = {
+            'r2': float(r2_score(y, y_pred)),
+            'mse': float(mean_squared_error(y, y_pred)),
+            'coef_': model.coef_.tolist(),
+        }
+
+        return model, scores
 
     def regime_switch(
         self,

@@ -2,10 +2,6 @@ import numpy as np
 import pandas as pd
 
 # ---- 辅助函数 ----
-def _broadcast(gen, market_series: pd.Series) -> pd.DataFrame:
-    """广播市场级Series到个股DataFrame."""
-    return pd.DataFrame({c: market_series.values for c in gen.close.columns}, index=market_series.index)
-
 def cs_zscore(gen, x: pd.DataFrame, clip: float=None) -> pd.DataFrame:
     """截面 z-score 标准化."""
     mu = x.mean(axis=1)
@@ -23,6 +19,10 @@ def vol_regime(gen, window: int=60) -> pd.Series:
     mkt_ret = gen.close.pct_change().mean(axis=1)
     vol = mkt_ret.rolling(window, min_periods=20).std() * np.sqrt(252)
     return vol.rank(pct=True).fillna(0.5)
+
+def _broadcast(gen, market_series: pd.Series) -> pd.DataFrame:
+    """广播市场级Series到个股DataFrame."""
+    return pd.DataFrame({c: market_series.values for c in gen.close.columns}, index=market_series.index)
 
 # ---- 因子函数 ----
 def compute(gen, params):

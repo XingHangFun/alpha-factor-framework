@@ -2,6 +2,28 @@ import numpy as np
 import pandas as pd
 
 # ---- 辅助函数 ----
+def cs_zscore(gen, x: pd.DataFrame, clip: float=None) -> pd.DataFrame:
+    """截面 z-score 标准化."""
+    mu = x.mean(axis=1)
+    sigma = x.std(axis=1).replace(0, np.nan)
+    result = x.sub(mu, axis=0).div(sigma, axis=0)
+    if clip is not None:
+        result = result.clip(-clip, clip)
+    return result
+
+def cs_rank_uniform(gen, x: pd.DataFrame) -> pd.DataFrame:
+    """截面 rank 映射到 [-1, 1]."""
+    r = x.rank(axis=1, pct=True)
+    return (r - 0.5) * 2.0
+
+def cs_winsorize(gen, x: pd.DataFrame, sigma: float=3.0) -> pd.DataFrame:
+    """截面 winsorize — 用 mean±sigma*std 截断, 比MAD简洁."""
+    mu = x.mean(axis=1)
+    std = x.std(axis=1).replace(0, np.nan)
+    upper = mu + sigma * std
+    lower = mu - sigma * std
+    return x.clip(lower=lower, upper=upper, axis=0)
+
 def cs_mad_clip(gen, x: pd.DataFrame, n_sigma: float=3.0) -> pd.DataFrame:
     """截面 MAD 去极值. 常数1.4826将MAD转为σ等价值."""
     median = x.median(axis=1)
@@ -24,28 +46,6 @@ def cs_neutralize(gen, y: pd.DataFrame, x: pd.DataFrame) -> pd.DataFrame:
         resid.loc[mask] = col_y[mask] - (coef[0] * col_x[mask] + coef[1])
         return resid
     return y.combine(x, _regress)
-
-def cs_rank_uniform(gen, x: pd.DataFrame) -> pd.DataFrame:
-    """截面 rank 映射到 [-1, 1]."""
-    r = x.rank(axis=1, pct=True)
-    return (r - 0.5) * 2.0
-
-def cs_winsorize(gen, x: pd.DataFrame, sigma: float=3.0) -> pd.DataFrame:
-    """截面 winsorize — 用 mean±sigma*std 截断, 比MAD简洁."""
-    mu = x.mean(axis=1)
-    std = x.std(axis=1).replace(0, np.nan)
-    upper = mu + sigma * std
-    lower = mu - sigma * std
-    return x.clip(lower=lower, upper=upper, axis=0)
-
-def cs_zscore(gen, x: pd.DataFrame, clip: float=None) -> pd.DataFrame:
-    """截面 z-score 标准化."""
-    mu = x.mean(axis=1)
-    sigma = x.std(axis=1).replace(0, np.nan)
-    result = x.sub(mu, axis=0).div(sigma, axis=0)
-    if clip is not None:
-        result = result.clip(-clip, clip)
-    return result
 
 def factor_process(gen, factor: pd.DataFrame, outlier: str='mad', outlier_sigma: float=3.0, neutralize: bool=True, neutralize_by: str='market_cap', industry: pd.DataFrame=None, zscore: bool=True, smooth: int=5, rank_output: bool=False, clip: float=3.0, fillna: bool=True) -> pd.DataFrame:
     """

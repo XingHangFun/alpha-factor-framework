@@ -2,10 +2,6 @@ import numpy as np
 import pandas as pd
 
 # ---- 辅助函数 ----
-def _broadcast(gen, market_series: pd.Series) -> pd.DataFrame:
-    """广播市场级Series到个股DataFrame."""
-    return pd.DataFrame({c: market_series.values for c in gen.close.columns}, index=market_series.index)
-
 def cs_zscore(gen, x: pd.DataFrame, clip: float=None) -> pd.DataFrame:
     """截面 z-score 标准化."""
     mu = x.mean(axis=1)
@@ -14,6 +10,25 @@ def cs_zscore(gen, x: pd.DataFrame, clip: float=None) -> pd.DataFrame:
     if clip is not None:
         result = result.clip(-clip, clip)
     return result
+
+def panic_state(gen, window: int=60) -> pd.Series:
+    """
+        恐慌状态 (0~1, 市场级).
+        综合下行波动率占比 + 回撤深度 + Chopiness.
+        """
+    mkt_ret = gen.close.pct_change().mean(axis=1)
+    dn = mkt_ret.clip(upper=0)
+    dn_vol = dn.rolling(window, min_periods=20).std()
+    tv = mkt_ret.rolling(window, min_periods=20).std()
+    vol_ratio = (dn_vol / tv.replace(0, np.nan)).fillna(0.5)
+    mkt_price = gen.close.mean(axis=1)
+    dd = (mkt_price / mkt_price.rolling(window, min_periods=20).max() - 1).clip(upper=0)
+    am = mkt_ret.abs().rolling(20, min_periods=10).mean()
+    rm = mkt_ret.rolling(20, min_periods=10).mean()
+    cp = (am / (rm.abs() + am * 0.01)).clip(1, 20)
+    cn = 1 - 1 / cp
+    p = 0.35 * vol_ratio.rank(pct=True) + 0.35 * (-dd).rank(pct=True) + 0.3 * cn.rank(pct=True)
+    return p.fillna(0.5).clip(0, 1).ewm(span=5, min_periods=3).mean()
 
 def discrete_switch(gen, alpha_factor: pd.DataFrame, defense_factor: pd.DataFrame=None, enter_signal=None, exit_signal=None, confirm: int=1) -> pd.DataFrame:
     """
@@ -41,24 +56,9 @@ def discrete_switch(gen, alpha_factor: pd.DataFrame, defense_factor: pd.DataFram
     state = enter.where(enter, other=(~exit_).where(exit_)).ffill().fillna(False)
     return alpha_factor[cols].where(~state, defense_factor[cols])
 
-def panic_state(gen, window: int=60) -> pd.Series:
-    """
-        恐慌状态 (0~1, 市场级).
-        综合下行波动率占比 + 回撤深度 + Chopiness.
-        """
-    mkt_ret = gen.close.pct_change().mean(axis=1)
-    dn = mkt_ret.clip(upper=0)
-    dn_vol = dn.rolling(window, min_periods=20).std()
-    tv = mkt_ret.rolling(window, min_periods=20).std()
-    vol_ratio = (dn_vol / tv.replace(0, np.nan)).fillna(0.5)
-    mkt_price = gen.close.mean(axis=1)
-    dd = (mkt_price / mkt_price.rolling(window, min_periods=20).max() - 1).clip(upper=0)
-    am = mkt_ret.abs().rolling(20, min_periods=10).mean()
-    rm = mkt_ret.rolling(20, min_periods=10).mean()
-    cp = (am / (rm.abs() + am * 0.01)).clip(1, 20)
-    cn = 1 - 1 / cp
-    p = 0.35 * vol_ratio.rank(pct=True) + 0.35 * (-dd).rank(pct=True) + 0.3 * cn.rank(pct=True)
-    return p.fillna(0.5).clip(0, 1).ewm(span=5, min_periods=3).mean()
+def _broadcast(gen, market_series: pd.Series) -> pd.DataFrame:
+    """广播市场级Series到个股DataFrame."""
+    return pd.DataFrame({c: market_series.values for c in gen.close.columns}, index=market_series.index)
 
 # ---- 因子函数 ----
 def compute(gen, params):
